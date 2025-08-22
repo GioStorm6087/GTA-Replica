@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>GTA Lite — Real Models</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<style>
+  html, body { margin:0; height:100%; overflow:hidden; background:#0e0e0f; }
+  #hud {
+    position:fixed; left:12px; top:12px; color:#eee; font:14px/1.4 system-ui, Arial;
+    background:rgba(0,0,0,.4); padding:10px 12px; border-radius:10px; backdrop-filter: blur(4px);
+  }
+  #hud b { color:#fff; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div><b>WASD</b> move • <b>E</b> interact (enter/exit car, buy) • <b>Space</b> pickup</div>
+  <div>Money: <span id="money">5000</span> • Health: <span id="health">100</span> • Score: <span id="score">0</span></div>
+  <div>Status: <span id="status">On foot</span></div>
+</div>
+
+<!-- Three.js + helpers -->
+<script src="https://cdn.jsdelivr.net/npm/three@0.156.1/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.156.1/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.156.1/examples/js/loaders/GLTFLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.156.1/examples/js/loaders/DRACOLoader.js"></script>
+
+<script>
+/* ==============================
+   Asset paths (put your GLBs here)
+   ============================== */
+const ASSETS = {
+  human: "models/human.glb",          // Mixamo rig with 'Idle' and 'Walk' clips
+  car: "models/car.glb",              // any car GLB (forward along -Z or +Z is fine)
+  house: "models/house.glb",          // house GLB (scaled to ~3–8m wide)
+  dealership: "models/dealership.glb",// optional; use house.glb if missing
+  pickupHealth: "models/health.glb",  // small health item
+  pickupWeapon: "models/weapon.glb"   // small weapon item
+};
+
+/* ==============================
+   Scene, Camera, Renderer
+   ============================== */
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111214);
+
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.shadowMap.enabled = true;
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.1, 2000);
+camera.position.set(0, 8, 18);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.enablePan = false;
+controls.maxPolarAngle = Math.PI * 0.49;
+
+/* ==============================
+   Lights & Ground
+   ============================== */
+const sun = new THREE.DirectionalLight(0xffffff, 2.0);
+sun.position.set(20, 40, 20);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -80;
+sun.shadow.camera.right = 80;
+sun.shadow.camera.top = 80;
+sun.shadow.camera.bottom = -80;
+scene.add(sun);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+
+const groundGeo = new THREE.PlaneGeometry(400, 400);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x2a2f33, metalness:0.0, roughness:1.0 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI/2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+/* ==============================
+   Loaders
+   ============================== */
+const draco = new THREE.DRACOLoader();
+draco.setDecoderPath("https://cdn.jsdelivr.net/npm/three@0.156.1/examples/js/libs/draco/");
+const loader = new THREE.GLTFLoader();
+loader.setDRACOLoader(draco);
+
+/* ==============================
+   Game State
+   ============================== */
+const ui = {
+  money: document.getElementById("money"),
+  health: document.getElementById("health"),
+  score: document.getElementById("score"),
+  status: document.getElementById("status")
+};
+
+const player = {
+  pos: new THREE.Vector3(0,0,0),
+  speed: 0.065,        // walk speed
+  health: 100,
+  money: 5000,
+  score: 0,
+  inCar: false,
+  inHouse: false,
+  car: null,
+  mesh: null,
+  mixer: null,
+  actions: {},
+  currentAction: "Idle",
+};
+
+const world = {
+  dealership: { pos: new THREE.Vector3(0,0,15), mesh: null },
+  houses: [
+    { pos:new THREE.Vector3(-10,0,-10), price:1000, owned:false, insidePos:new THREE.Vector3(-10,0,0), mesh:null },
+    { pos:new THREE.Vector3( 10,0,-10), price:1500, owned:false, insidePos:new THREE.Vector3( 10,0,0), mesh:null }
+  ],
+  cars: [],
+  npcs: [
+    { pos:new THREE.Vector3(5,0,5), dir:new THREE.Vector3(1,0,0), mesh:null, mixer:null },
+    { pos:new THREE.Vector3(-5,0,5), dir:new THREE.Vector3(-1,0,0), mesh:null, mixer:null }
+  ],
+  pickups: [
+    { pos:new THREE.Vector3(8,0,8), type:"weapon", mesh:null },
+    { pos:new THREE.Vector3(-8,0,8), type:"health", mesh:null }
+  ]
+};
+
+/* ==============================
+   Helpers
+   ============================== */
+function dist(a,b){ return a.distanceTo(b); }
+
+function updateHUD(){
+  ui.money.textContent = player.money|0;
+  ui.health.textContent = player.health|0;
+  ui.score.textContent = player.score|0;
+  ui.status.textContent = player.inCar ? "Driving" : (player.inHouse ? "Inside house" : "On foot");
+}
+
+function setPlayerAction(name){
+  if(!player.mixer || !player.actions[name] || player.currentAction===name) return;
+  const prev = player.actions[player.currentAction];
+  const next = player.actions[name];
+  if(prev) prev.fadeOut(0.2);
+  next.reset().fadeIn(0.2).play();
+  player.currentAction = name;
+}
+
+function loadGLB(path, {position, rotation, scale=1, castShadow=true, receiveShadow=false} = {}){
+  return new Promise((resolve, reject)=>{
+    loader.load(path, gltf=>{
+      const obj = gltf.scene || gltf.scenes[0];
+      if(!obj) return reject("No scene in GLB: "+path);
+      obj.traverse(o=>{
+        if(o.isMesh){ o.castShadow = castShadow; o.receiveShadow = receiveShadow; o.material && (o.material.side = THREE.FrontSide); }
+      });
+      if(position) obj.position.copy(position);
+      if(rotation) obj.rotation.set(rotation.x, rotation.y, rotation.z);
+      obj.scale.setScalar(scale);
+      scene.add(obj);
+      resolve({gltf, object: obj});
+    }, undefined, reject);
+  });
+}
+
+/* ==============================
+   Spawners
+   ============================== */
+async function spawnHuman(pos, withAnimations=true){
+  const {gltf, object} = await loadGLB(ASSETS.human, { position: pos, scale: 1.0 });
+  let mixer = null, actions = {};
+  if(withAnimations && gltf.animations && gltf.animations.length){
+    mixer = new THREE.AnimationMixer(object);
+    // Try to find 'Idle' and 'Walk'; if not present, just use the first clip.
+    const byName = Object.fromEntries(gltf.animations.map(a=>[a.name.toLowerCase(), a]));
+    const idleClip = byName["idle"] || gltf.animations[0];
+    const walkClip = byName["walk"] || gltf.animations[0];
+
+    actions.Idle = mixer.clipAction(idleClip);
+    actions.Walk = mixer.clipAction(walkClip);
+    actions.Idle.play();
+  }
+  return { mesh: object, mixer, actions };
+}
+
+async function spawnCar(pos){
+  const {object} = await loadGLB(ASSETS.car, { position: pos, scale: 1.0 });
+  const car = {
+    mesh: object,
+    pos: pos.clone(),
+    dir: new THREE.Vector3(0,0,1), // forward; will adjust to model orientation if needed
+    vel: 0,
+    steer: 0,
+    maxSpeed: 0.45,
+    accel: 0.015,
+    brake: 0.03,
+    turnRate: 0.03,
+    friction: 0.008
+  };
+  world.cars.push(car);
+  return car;
+}
+
+async function spawnHouse(pos){
+  const {object} = await loadGLB(ASSETS.house, { position: pos, scale: 1.0, castShadow:true, receiveShadow:true });
+  return object;
+}
+
+async function spawnDealership(pos){
+  const path = ASSETS.dealership || ASSETS.house;
+  const {object} = await loadGLB(path, { position: pos, scale: 1.0, castShadow:true, receiveShadow:true });
+  return object;
+}
+
+async function spawnPickup(pos, type){
+  const path = type==="health" ? ASSETS.pickupHealth : ASSETS.pickupWeapon;
+  const {object} = await loadGLB(path, { position: pos, scale: 0.7, castShadow:true, receiveShadow:true });
+  return object;
+}
+
+/* ==============================
+   Input
+   ============================== */
+const keys = Object.create(null);
+addEventListener('keydown', e => keys[e.key.toLowerCase()] = true);
+addEventListener('keyup',   e => keys[e.key.toLowerCase()] = false);
+
+/* ==============================
+   Interact & Actions
+   ============================== */
+function interact(){
+  const ppos = player.inCar && player.car ? player.car.mesh.position : player.mesh.position;
+
+  // Houses
+  for(const h of world.houses){
+    if(dist(ppos, h.pos) < 3){
+      if(!h.owned){
+        if(player.money >= h.price){
+          player.money -= h.price;
+          h.owned = true;
+          // Visual nudge: slightly tint
+          h.mesh.traverse(o=>{ if(o.isMesh){ o.material = o.material.clone(); o.material.emissive = new THREE.Color(0x003300); }});
+        }
+      } else {
+        player.inHouse = !player.inHouse;
+        if(player.inHouse){
+          player.mesh.position.copy(h.insidePos);
+        }else{
+          player.mesh.position.copy(h.pos).add(new THREE.Vector3(1.5,0,0));
+        }
+      }
+      updateHUD();
+      break;
+    }
+  }
+
+  // Dealership
+  if(dist(ppos, world.dealership.pos) < 3){
+    if(player.money >= 2000){
+      player.money -= 2000;
+      spawnCar(ppos.clone().add(new THREE.Vector3(2,0,0)));
+      updateHUD();
+    }
+  }
+
+  // Enter/Exit car
+  for(const c of world.cars){
+    if(dist(ppos, c.mesh.position) < 2){
+      player.inCar = !player.inCar;
+      player.car = player.inCar ? c : null;
+      updateHUD();
+      break;
+    }
+  }
+}
+
+function doPickup(){
+  const refPos = player.inCar && player.car ? player.car.mesh.position : player.mesh.position;
+  for(let i=world.pickups.length-1; i>=0; i--){
+    const p = world.pickups[i];
+    if(dist(refPos, p.pos) < 2.2){
+      player.score += 10;
+      if(p.type === "health"){
+        player.health = Math.min(100, player.health + 25);
+      }
+      scene.remove(p.mesh);
+      world.pickups.splice(i,1);
+      updateHUD();
+    }
+  }
+}
+
+/* ==============================
+   Movement
+   ============================== */
+function moveOnFoot(dt){
+  const forward = new THREE.Vector3(0,0,-1);
+  const right = new THREE.Vector3(1,0,0);
+  const pos = player.mesh.position;
+  let moving = false;
+
+  if(keys['w']){ pos.addScaledVector(forward,  player.speed * dt * 60); moving = true; }
+  if(keys['s']){ pos.addScaledVector(forward, -player.speed * dt * 60); moving = true; }
+  if(keys['a']){ pos.addScaledVector(right,   -player.speed * dt * 60); moving = true; }
+  if(keys['d']){ pos.addScaledVector(right,    player.speed * dt * 60); moving = true; }
+
+  setPlayerAction(moving ? "Walk" : "Idle");
+}
+
+function driveCar(dt){
+  const c = player.car;
+  if(!c) return;
+
+  // Inputs
+  if(keys['w']) c.vel += c.accel * dt * 60;
+  if(keys['s']) c.vel -= c.brake * dt * 60;
+  if(keys['a']) c.steer = THREE.MathUtils.lerp(c.steer,  1, 0.2);
+  else if(keys['d']) c.steer = THREE.MathUtils.lerp(c.steer, -1, 0.2);
+  else c.steer = THREE.MathUtils.lerp(c.steer, 0, 0.2);
+
+  // Clamp speed
+  c.vel = THREE.MathUtils.clamp(c.vel, -c.maxSpeed, c.maxSpeed);
+
+  // Friction
+  if(!keys['w'] && !keys['s']){
+    const sign = Math.sign(c.vel);
+    const mag = Math.max(0, Math.abs(c.vel) - c.friction * dt * 60);
+    c.vel = mag * sign;
+  }
+
+  // Turn proportional to speed
+  const turn = c.turnRate * c.steer * (c.vel / c.maxSpeed) * dt * 60;
+  c.mesh.rotation.y -= turn;
+
+  // Forward direction from rotation
+  const forward = new THREE.Vector3(0,0,-1).applyAxisAngle(new THREE.Vector3(0,1,0), c.mesh.rotation.y);
+  c.mesh.position.addScaledVector(forward, c.vel * dt * 60);
+}
+
+/* ==============================
+   Camera Follow
+   ============================== */
+function updateCamera(dt){
+  const targetObj = player.inCar && player.car ? player.car.mesh : player.mesh;
+  const desired = targetObj.position.clone().add(new THREE.Vector3(0,6,12).applyEuler(new THREE.Euler(0, targetObj.rotation.y, 0)));
+  camera.position.lerp(desired, 0.08);
+  camera.lookAt(targetObj.position.clone().add(new THREE.Vector3(0,2,0)));
+}
+
+/* ==============================
+   Setup & Main
+   ============================== */
+let clock = new THREE.Clock();
+
+(async function init(){
+  // Player (human)
+  const human = await spawnHuman(player.pos);
+  player.mesh = human.mesh;
+  player.mixer = human.mixer;
+  player.actions = human.actions;
+
+  // Houses
+  for(const h of world.houses){
+    h.mesh = await spawnHouse(h.pos);
+  }
+
+  // Dealership
+  world.dealership.mesh = await spawnDealership(world.dealership.pos);
+
+  // Starter car
+  await spawnCar(new THREE.Vector3(0,0,5));
+
+  // NPCs (re-use human model)
+  for(const npc of world.npcs){
+    const h = await spawnHuman(npc.pos, true);
+    npc.mesh = h.mesh;
+    npc.mixer = h.mixer;
+    // Play walk loop softly so they look alive
+    if(npc.mixer && h.actions.Walk){ h.actions.Walk.play(); }
+  }
+
+  // Pickups
+  for(const p of world.pickups){
+    p.mesh = await spawnPickup(p.pos, p.type);
+  }
+
+  updateHUD();
+  animate();
+})().catch(err=>console.error(err));
+
+/* ==============================
+   Loop
+   ============================== */
+function animate(){
+  requestAnimationFrame(animate);
+  const dt = clock.getDelta();
+
+  // Input-driven actions
+  if(keys['e']) { keys['e'] = false; interact(); }
+  if(keys[' ']) { keys[' '] = false; doPickup(); }
+
+  if(player.inCar) driveCar(dt);
+  else if(player.mesh) moveOnFoot(dt);
+
+  // Update mixers
+  if(player.mixer) player.mixer.update(dt);
+  for(const n of world.npcs){ if(n.mixer) n.mixer.update(dt); }
+
+  // Simple NPC patrol
+  for(const n of world.npcs){
+    n.pos.addScaledVector(n.dir, 0.03 * (dt*60));
+    if(Math.abs(n.pos.x) > 20) n.dir.x *= -1;
+    if(Math.abs(n.pos.z) > 20) n.dir.z *= -1;
+    if(n.mesh) n.mesh.position.copy(n.pos);
+  }
+
+  // Sync car positions for logic
+  for(const c of world.cars){ c.pos.copy(c.mesh.position); }
+
+  updateCamera(dt);
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+/* ==============================
+   Resize
+   ============================== */
+addEventListener('resize', ()=>{
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
